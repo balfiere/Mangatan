@@ -11,19 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check_wrapper:
-    name: Validate Gradle Wrapper
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone repo
-        uses: actions/checkout@v4 # Updated to v4 (standard stable)
-        with:
-          submodules: recursive        
-
-      # - name: Validate Gradle Wrapper
-      #   uses: gradle/actions/wrapper-validation@v3 # Updated to v3
-
-  # --- NEW JOB: Compile Deno OCR Server ---
+  # --- JOB 1: Compile Deno OCR Server ---
   build_ocr:
     name: Build OCR Binaries
     runs-on: ubuntu-latest
@@ -37,7 +25,20 @@ jobs:
           deno-version: v2.x
 
       - name: Compile OCR Server
-        run: make build-ocr-binaries
+        run: |
+          mkdir -p ocr-server/dist
+          
+          # Linux x64
+          cd ocr-server && deno compile --allow-net --allow-read --allow-write --allow-env --target x86_64-unknown-linux-gnu --output dist/ocr-server-linux server.ts
+          
+          # Windows x64
+          deno compile --allow-net --allow-read --allow-write --allow-env --target x86_64-pc-windows-msvc --output dist/ocr-server-win.exe server.ts
+          
+          # macOS Intel (x64)
+          deno compile --allow-net --allow-read --allow-write --allow-env --target x86_64-apple-darwin --output dist/ocr-server-macos-x64 server.ts
+
+          # macOS Apple Silicon (ARM64)
+          deno compile --allow-net --allow-read --allow-write --allow-env --target aarch64-apple-darwin --output dist/ocr-server-macos-arm64 server.ts
 
       - name: Upload OCR Artifacts
         uses: actions/upload-artifact@v4
@@ -45,77 +46,9 @@ jobs:
           name: ocr-binaries
           path: ocr-server/dist/*
 
-  build:
-    name: Build Jar
-    needs: [check_wrapper, build_ocr] # Added dependency on build_ocr
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          path: master
-          fetch-depth: 0
-          submodules: recursive          
-
-      # --- NEW STEP: Inject OCR Binaries into Resources ---
-      - name: Download OCR Binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: ocr-binaries
-          # This puts the binaries where Gradle will include them in the JAR
-          path: master/Suwayomi-Server/server/src/main/resources/ocr-binaries
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: 25
-          distribution: 'zulu'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Copy CI gradle.properties
-        run: |
-          cd master/Suwayomi-Server
-          mkdir -p ~/.gradle
-          cp .github/runner-files/ci-gradle.properties \
-            ~/.gradle/gradle.properties
-
-      - name: Build and copy webUI, Build Jar
-        env:
-          ProductBuildType: "Stable"
-        working-directory: master/Suwayomi-Server
-        # ShadowJar will automatically pick up the files in src/main/resources
-        run: |
-          echo "ls $(ls)"
-          ./gradlew :server:downloadWebUI :server:shadowJar --stacktrace
-
-      - name: Upload Jar
-        uses: actions/upload-artifact@v4
-        with:
-          name: jar
-          path: master/Suwayomi-Server/server/build/*.jar
-          if-no-files-found: error
-
-      - name: Upload icons
-        uses: actions/upload-artifact@v4
-        with:
-          name: icon
-          path: master/Suwayomi-Server/server/src/main/resources/icon
-          if-no-files-found: error
-
-      - name: Tar scripts dir to maintain file permissions
-        run: tar -cvzf scripts.tar.gz -C master/Suwayomi-Server/ scripts/
-
-      - name: Upload scripts.tar.gz
-        uses: actions/upload-artifact@v4
-        with:
-          name: scripts
-          path: scripts.tar.gz
-          if-no-files-found: error
-
+  # --- JOB 2: Build Custom JREs (Required for embedding) ---
   jlink:
+    name: Build JRE (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -124,12 +57,10 @@ jobs:
             name: linux-x64
           - os: windows-latest
             name: windows-x64
-          - os: macos-14
-            name: macOS-arm64
-          - os: macos-13
+          - os: macos-13 # Intel Mac
             name: macOS-x64
-        os: [ubuntu-latest, windows-latest, macos-14, macos-13]
-
+          - os: macos-14 # ARM Mac (M1/M2)
+            name: macOS-arm64
     steps:
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -137,121 +68,171 @@ jobs:
           java-version: 25
           distribution: 'zulu'
 
-      - name: Package JDK
+      - name: Create Custom Runtime Image
         run: jlink --add-modules java.base,java.compiler,java.datatransfer,java.desktop,java.instrument,java.logging,java.management,java.naming,java.prefs,java.scripting,java.se,java.security.jgss,java.security.sasl,java.sql,java.transaction.xa,java.xml,jdk.attach,jdk.crypto.ec,jdk.jdi,jdk.management,jdk.net,jdk.unsupported,jdk.unsupported.desktop,jdk.zipfs,jdk.accessibility --output suwa --strip-debug --no-man-pages --no-header-files --compress=2
 
-      - name: Upload JDK package
+      - name: Upload JRE
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}-jre
           path: suwa
 
-  bundle:
+  # --- JOB 3: Build Mangatan Launcher (The All-in-One Binary) ---
+  build_mangatan:
+    name: Build Mangatan (${{ matrix.name }})
+    needs: [build_ocr, jlink]
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: debian-all
-            jre: linux-x64
-          - name: appimage
-            jre: linux-x64
-          - name: linux-assets
-            jre: linux-assets
-          - name: linux-x64
-            jre: linux-x64
-          - name: macOS-x64
-            jre: macOS-x64
-          - name: macOS-arm64
-            jre: macOS-arm64
-          - name: windows-x64
-            jre: windows-x64
-        name: [debian-all, appimage, linux-assets, linux-x64, macOS-x64, macOS-arm64, windows-x64]
+          - name: Linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: mangatan
+            jre_name: linux-x64
+            ocr_binary: ocr-server-linux
+            
+          - name: Windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: mangatan.exe
+            jre_name: windows-x64
+            ocr_binary: ocr-server-win.exe
+            
+          - name: macOS-Intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary_name: mangatan
+            jre_name: macOS-x64
+            ocr_binary: ocr-server-macos-x64
+            
+          - name: macOS-Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary_name: mangatan
+            jre_name: macOS-arm64
+            ocr_binary: ocr-server-macos-arm64
 
-    name: Make ${{ matrix.name }} release
-    needs: [build, jlink]
-    runs-on: ubuntu-latest
     steps:
-      - name: Download Jar
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --- ASSET PREPARATION ---
+      - name: Create Resources Directory
+        shell: bash
+        run: mkdir -p bin/mangatan/resources
+
+      # 1. OCR Binary
+      - name: Download OCR Binaries
         uses: actions/download-artifact@v4
         with:
-          name: jar
-          path: server/build
+          name: ocr-binaries
+          path: temp_ocr
 
+      - name: Place OCR Binary
+        shell: bash
+        run: cp temp_ocr/${{ matrix.ocr_binary }} bin/mangatan/resources/
+
+      # 2. JRE Bundle
       - name: Download JRE
         uses: actions/download-artifact@v4
-        if: matrix.name != 'linux-assets' && matrix.name != 'debian-all'
         with:
-          name: ${{ matrix.jre }}-jre
-          path: jre
+          name: ${{ matrix.jre_name }}-jre
+          path: temp_jre
 
-      - name: Download icons
-        uses: actions/download-artifact@v4
-        with:
-          name: icon
-          path: server/src/main/resources/icon
-
-      - name: Download scripts.tar.gz
-        uses: actions/download-artifact@v4
-        with:
-          name: scripts
-
-      - name: Make ${{ matrix.name }} release
+      - name: Zip JRE for Embedding
+        shell: bash
         run: |
-          mkdir upload/
-          tar -xvpf scripts.tar.gz
-          scripts/bundler.sh -o upload/ ${{ matrix.name }}
+          cd temp_jre
+          # Cross-platform zip logic
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a -tzip ../bin/mangatan/resources/jre_bundle.zip *
+          else
+            zip -r ../bin/mangatan/resources/jre_bundle.zip .
+          fi
 
-      - name: Upload ${{ matrix.name }} files
+      # 3. Suwayomi JAR (Specified URL)
+      - name: Download Suwayomi JAR
+        shell: bash
+        run: |
+          curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2019/Suwayomi-Server-v2.1.2019.jar" -o bin/mangatan/resources/suwayomi-server.jar
+
+      # 4. WebUI (Specified URL)
+      - name: Download and Setup WebUI
+        shell: bash
+        run: |
+          curl -L "https://github.com/KolbyML/Suwayomi-WebUI/releases/download/v1.0.7/Suwayomi-WebUI-v1.0.7.zip" -o webui.zip
+          unzip webui.zip -d bin/mangatan/resources/
+          mv bin/mangatan/resources/Suwayomi-WebUI-v1.0.7 bin/mangatan/resources/suwayomi-webui
+
+      # --- COMPILATION ---
+      - name: Build Rust Binary
+        shell: bash
+        run: |
+          cd bin/mangatan
+          cargo build --release --target ${{ matrix.target }} --features embed-jre
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: upload/*
-          if-no-files-found: error
+          name: mangatan-${{ matrix.jre_name }}
+          path: bin/mangatan/target/${{ matrix.target }}/release/${{ matrix.binary_name }}
 
+  # --- JOB 4: Release ---
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: bundle
+    needs: [build_mangatan]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download Linux
+        uses: actions/download-artifact@v4
         with:
-          name: jar
-          path: release
-      - uses: actions/download-artifact@v4
+          name: mangatan-linux-x64
+          path: release/linux
+          
+      - name: Download Windows
+        uses: actions/download-artifact@v4
         with:
-          name: debian-all
-          path: release
-      - uses: actions/download-artifact@v4
+          name: mangatan-windows-x64
+          path: release/windows
+          
+      - name: Download Mac Intel
+        uses: actions/download-artifact@v4
         with:
-          name: appimage
-          path: release
-      - uses: actions/download-artifact@v4
+          name: mangatan-macOS-x64
+          path: release/mac-intel
+          
+      - name: Download Mac Silicon
+        uses: actions/download-artifact@v4
         with:
-          name: linux-assets
-          path: release
-      - uses: actions/download-artifact@v4
-        with:
-          name: linux-x64
-          path: release
-      - uses: actions/download-artifact@v4
-        with:
-          name: macOS-x64
-          path: release
-      - uses: actions/download-artifact@v4
-        with:
-          name: macOS-arm64
-          path: release
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-x64
-          path: release
+          name: mangatan-macOS-arm64
+          path: release/mac-silicon
 
-      - name: Generate checksums
-        run: cd release && sha256sum * > Checksums.sha256
+      - name: Prepare Assets
+        run: |
+          mkdir final_release
+          mv release/linux/mangatan final_release/Mangatan-Linux-x64
+          mv release/windows/mangatan.exe final_release/Mangatan-Windows-x64.exe
+          mv release/mac-intel/mangatan final_release/Mangatan-macOS-Intel
+          mv release/mac-silicon/mangatan final_release/Mangatan-macOS-Silicon
+          
+          # Make binaries executable (Linux/Mac)
+          chmod +x final_release/Mangatan-Linux-x64
+          chmod +x final_release/Mangatan-macOS-Intel
+          chmod +x final_release/Mangatan-macOS-Silicon
 
-      - name: Release
+      - name: Generate Checksums
+        run: cd final_release && sha256sum * > Checksums.sha256
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           draft: true
-          files: release/*
+          files: final_release/*

@@ -1,0 +1,33 @@
+[package]
+name = "mangatan"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = []
+embed-jre = []
+
+[dependencies]
+axum.workspace = true
+directories.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+image.workspace = true
+mime_guess.workspace = true
+open.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+tao.workspace = true    
+tokio.workspace = true
+tower-http.workspace = true
+tray-icon.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

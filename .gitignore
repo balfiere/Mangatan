@@ -141,3 +141,7 @@ vite.config.ts.timestamp-*
 */ocr-server
 */ocr-cache.json
 */uploads
+
+bin/mangatan/resources/*
+target
+.DS_Store
