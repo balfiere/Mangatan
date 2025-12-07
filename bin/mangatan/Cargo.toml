@@ -14,8 +14,10 @@ default = []
 embed-jre = []
 
 [dependencies]
+anyhow.workspace = true
 axum.workspace = true
 directories.workspace = true
+eframe.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 image.workspace = true
@@ -26,7 +28,6 @@ rust-embed.workspace = true
 tao.workspace = true    
 tokio.workspace = true
 tower-http.workspace = true
-tray-icon.workspace = true
 zip.workspace = true
 
 [lints]

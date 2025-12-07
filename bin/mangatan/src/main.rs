@@ -3,8 +3,11 @@ use std::{
     io::{self, Cursor, Write},
     path::{Path, PathBuf},
     process::Stdio,
+    thread,
+    time::Duration,
 };
 
+use anyhow::anyhow;
 use axum::{
     Router,
     body::Body,
@@ -14,19 +17,18 @@ use axum::{
     routing::any,
 };
 use directories::ProjectDirs;
+use eframe::{
+    egui::{self},
+    icon_data,
+};
 use futures::TryStreamExt;
 use reqwest::Client;
 use rust_embed::RustEmbed;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tokio::{process::Command, sync::mpsc};
+use tokio::{process::Command, sync::mpsc, time::sleep};
 use tower_http::cors::{Any, CorsLayer};
-use tray_icon::{
-    TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
 
 const ICON_BYTES: &[u8] = include_bytes!("../resources/faviconlogo.png");
-const JAR_BYTES: &[u8] = include_bytes!("../resources/suwayomi-server.jar");
+const JAR_BYTES: &[u8] = include_bytes!("../resources/Suwayomi-Server.jar");
 
 #[cfg(feature = "embed-jre")]
 const JRE_BYTES: &[u8] = include_bytes!("../resources/jre_bundle.zip");
@@ -47,91 +49,96 @@ const OCR_BYTES: &[u8] = include_bytes!("../resources/ocr-server-macos-x64");
 #[folder = "resources/suwayomi-webui"]
 struct FrontendAssets;
 
-fn main() {
-    let event_loop = EventLoopBuilder::new().build();
-    let icon = load_icon(ICON_BYTES);
-
-    let tray_menu = Menu::new();
-    let open_browser_item = MenuItem::new("Open Web UI", true, None);
-    let quit_item = MenuItem::new("Quit", true, None);
-
-    let _ = tray_menu.append(&open_browser_item);
-    let _ = tray_menu.append(&PredefinedMenuItem::separator());
-    let _ = tray_menu.append(&quit_item);
-
-    let _tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("Mangatan Server")
-        .with_icon(icon)
-        .build()
-        .expect("Failed to build tray icon");
-
-    // Create a channel to signal shutdown
+fn main() -> eframe::Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(async {
-            // Pass the receiver to run_server
             if let Err(err) = run_server(&mut shutdown_rx).await {
                 eprintln!("Server crashed: {err}");
+                std::process::exit(1);
             }
         });
     });
 
-    let open_id = open_browser_item.id().clone();
-    let quit_id = quit_item.id().clone();
-    let menu_channel = MenuEvent::receiver();
+    let icon = icon_data::from_png_bytes(ICON_BYTES).expect("The icon data must be valid");
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([300.0, 150.0])
+            .with_icon(icon)
+            .with_title("Mangatan")
+            .with_resizable(false)
+            .with_maximize_button(false),
+        ..Default::default()
+    };
 
-    event_loop.run(move |_event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-
-        if let Ok(event) = menu_channel.try_recv() {
-            if event.id == open_id {
-                println!("Opening Browser...");
-                let _ = open::that("http://localhost:8080");
-            } else if event.id == quit_id {
-                println!("Shutting down...");
-
-                // Signal the background thread to stop
-                let _ = shutdown_tx.blocking_send(());
-
-                // Wait a moment for cleanup (optional, but good practice)
-                std::thread::sleep(std::time::Duration::from_millis(500));
-
-                *control_flow = ControlFlow::Exit;
-                std::process::exit(0);
-            }
-        }
-    });
+    eframe::run_native(
+        "Mangatan",
+        options,
+        Box::new(|_cc| Ok(Box::new(MyApp::new(shutdown_tx)))),
+    )
 }
 
-// Accept the shutdown receiver
-async fn run_server(
-    shutdown_signal: &mut mpsc::Receiver<()>,
-) -> Result<(), Box<dyn std::error::Error>> {
+struct MyApp {
+    _shutdown_tx: mpsc::Sender<()>,
+}
+
+impl MyApp {
+    fn new(tx: mpsc::Sender<()>) -> Self {
+        Self { _shutdown_tx: tx }
+    }
+}
+
+impl eframe::App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.heading("Mangatan is Running");
+                ui.add_space(20.0);
+                if ui
+                    .add(egui::Button::new("Open Web UI").min_size([120.0, 40.0].into()))
+                    .clicked()
+                {
+                    if let Err(err) = open::that("http://localhost:4568/library") {
+                        eprintln!("Failed to open web browser: {err}");
+                    }
+                }
+                ui.add_space(10.0);
+                ui.label("Close this window to stop the Mangatan.");
+            });
+        });
+    }
+}
+
+async fn run_server(shutdown_signal: &mut mpsc::Receiver<()>) -> Result<(), Box<anyhow::Error>> {
     println!("🚀 Initializing Mangatan Launcher...");
 
     let proj_dirs = ProjectDirs::from("com", "mangatan", "server")
-        .ok_or("Could not determine home directory")?;
+        .ok_or(anyhow!("Could not determine home directory"))?;
     let data_dir = proj_dirs.data_dir();
 
     if !data_dir.exists() {
-        fs::create_dir_all(data_dir)?;
+        fs::create_dir_all(data_dir)
+            .map_err(|err| anyhow!("Failed to create data directory: {err:?}"))?;
     }
     println!("📂 Data Directory: {}", data_dir.display());
 
     println!("📦 Extracting assets...");
-    let jar_path = extract_file(data_dir, "suwayomi-server.jar", JAR_BYTES)?;
+    let jar_path = extract_file(data_dir, "Suwayomi-Server.jar", JAR_BYTES)
+        .map_err(|err| anyhow!("Failed to extract Suwayomi-Server.jar: {err:?}"))?;
 
     let ocr_bin_name = if cfg!(target_os = "windows") {
         "ocr-server.exe"
     } else {
         "ocr-server"
     };
-    let ocr_path = extract_executable(data_dir, ocr_bin_name, OCR_BYTES)?;
+    let ocr_path = extract_executable(data_dir, ocr_bin_name, OCR_BYTES)
+        .map_err(|err| anyhow!("Failed to extract ocr server: {err:?}"))?;
 
-    let java_exec = resolve_java(data_dir)?;
+    let java_exec =
+        resolve_java(data_dir).map_err(|err| anyhow!("Failed to resolve java runtime: {err:?}"))?;
 
     println!("👁️ Spawning OCR (Port 3033)...");
     let mut ocr_proc = Command::new(&ocr_path)
@@ -140,7 +147,8 @@ async fn run_server(
         .kill_on_drop(true) // This works when the handle is dropped
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn()
+        .map_err(|err| anyhow!("Failed to spawn ocr server: {err:?}"))?;
 
     println!("☕ Spawning Suwayomi (Port 4567)...");
     let mut suwayomi_cmd = Command::new(&java_exec);
@@ -155,10 +163,11 @@ async fn run_server(
         .kill_on_drop(true)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    println!("DEBUG Executing Suwayomi: {:?}", suwayomi_cmd);
-    let mut suwayomi_proc = suwayomi_cmd.spawn()?;
+    let mut suwayomi_proc = suwayomi_cmd
+        .spawn()
+        .map_err(|err| anyhow!("Failed to spawn suwayomi server: {err:?}"))?;
 
-    println!("🌍 Starting Web Interface at http://localhost:8080");
+    println!("🌍 Starting Web Interface at http://localhost:4568");
     let client = Client::new();
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -174,11 +183,11 @@ async fn run_server(
         .layer(cors)
         .with_state(client);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4568")
+        .await
+        .map_err(|err| anyhow!("Failed create proxies socket: {err:?}"))?;
 
     let server_future = axum::serve(listener, app).into_future();
-
-    let _ = open::that("http://localhost:8080");
 
     tokio::select! {
         status = suwayomi_proc.wait() => {
@@ -204,23 +213,16 @@ async fn run_server(
 
     println!("🛑 Cleaning up background processes...");
 
-    // Explicitly killing just to be sure, though dropping the handles below would trigger kill_on_drop
-    let _ = suwayomi_proc.kill().await;
-    let _ = ocr_proc.kill().await;
+    // Explicitly killing just to be sure, though dropping the handles below would trigger
+    // kill_on_drop
+    if let Err(err) = suwayomi_proc.kill().await {
+        eprintln!("Failed to kill Suwayomi process: {err}");
+    }
+    if let Err(err) = ocr_proc.kill().await {
+        eprintln!("Failed to kill OCR process: {err}");
+    }
 
     Ok(())
-}
-
-fn load_icon(bytes: &[u8]) -> tray_icon::Icon {
-    let (icon_rgba, icon_width, icon_height) = {
-        let image = image::load_from_memory(bytes)
-            .expect("Failed to load icon bytes")
-            .into_rgba8();
-        let (width, height) = image.dimensions();
-        let rgba = image.into_raw();
-        (rgba, width, height)
-    };
-    tray_icon::Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to open icon")
 }
 
 async fn proxy_ocr_handler(State(client): State<Client>, req: Request) -> impl IntoResponse {
