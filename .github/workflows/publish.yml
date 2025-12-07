@@ -240,7 +240,7 @@ jobs:
           name: mangatan-macOS-arm64
           path: release/mac-silicon
 
-- name: Prepare Assets with Versioning
+      - name: Prepare Assets with Versioning
         run: |
           mkdir final_release
           VERSION=${{ github.ref_name }}
