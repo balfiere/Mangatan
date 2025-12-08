@@ -14,7 +14,7 @@ jobs:
   # --- JOB 1: Compile Deno OCR Server ---
   build_ocr:
     name: Build OCR Binaries
-    runs-on: ubuntu-20.04 # Use older distro for better compatibility
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,7 +45,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-20.04
+          - os: ubuntu-latest
             name: linux-x64
           - os: windows-latest
             name: windows-x64
@@ -80,8 +80,7 @@ jobs:
       matrix:
         include:
           - name: Linux-x64
-            # CRITICAL FIX: Build on Ubuntu 20.04 to support older GLIBC versions
-            os: ubuntu-20.04
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             arch_name: linux-x64
             ocr_binary: ocr-server-linux
@@ -401,7 +400,7 @@ jobs:
           
           # LINUX
           mv release/linux/*.deb final_release/Mangatan-${VERSION}-Linux-x64.deb
-          mv release/linux/*.AppImage final_release/Mangatan-${VERSION}-Linux-x64.AppImage
+          # mv release/linux/*.AppImage final_release/Mangatan-${VERSION}-Linux-x64.AppImage
           
           # MACOS
           mv release/mac-intel/Mangatan.app.zip final_release/Mangatan-${VERSION}-macOS-Intel.app.zip
