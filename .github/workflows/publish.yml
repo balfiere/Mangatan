@@ -40,7 +40,7 @@ jobs:
           path: ocr-server/dist/*
 
   # --- JOB 2: Build Custom JREs ---
-jlink:
+  jlink:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
