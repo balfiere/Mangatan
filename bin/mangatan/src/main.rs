@@ -12,7 +12,10 @@ use anyhow::anyhow;
 use axum::{
     Router,
     body::Body,
-    extract::{Request, State},
+    extract::{
+        FromRequestParts, Request, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
@@ -22,7 +25,7 @@ use eframe::{
     egui::{self},
     icon_data,
 };
-use futures::TryStreamExt;
+use futures::{SinkExt, StreamExt, TryStreamExt};
 #[cfg(feature = "embed-jre")]
 use mangatan_core::io::extract_zip;
 use mangatan_core::io::{extract_file, resolve_java};
@@ -194,7 +197,6 @@ impl eframe::App for MyApp {
 }
 
 async fn run_server(
-    // FIX: Removed `&mut` to take ownership of the receiver
     mut shutdown_signal: tokio::sync::mpsc::Receiver<()>,
     data_dir: &PathBuf,
 ) -> Result<(), Box<anyhow::Error>> {
@@ -295,8 +297,97 @@ async fn run_server(
     Ok(())
 }
 
-async fn proxy_suwayomi_handler(State(client): State<Client>, req: Request) -> impl IntoResponse {
+async fn proxy_suwayomi_handler(State(client): State<Client>, req: Request) -> Response {
+    let (mut parts, body) = req.into_parts();
+
+    let is_ws = parts
+        .headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_ws {
+        match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(ws) => {
+                let uri = parts.uri.clone();
+                return ws
+                    .on_upgrade(move |socket| handle_socket(socket, uri))
+                    .into_response();
+            }
+            Err(err) => {
+                return err.into_response();
+            }
+        }
+    }
+
+    let req = Request::from_parts(parts, body);
     proxy_request(client, req, "http://127.0.0.1:4567", "").await
+}
+
+async fn handle_socket(client_socket: WebSocket, uri: Uri) {
+    let path = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or(uri.path());
+    let backend_url = format!("ws://127.0.0.1:4567{path}");
+
+    let (backend_socket, _) = match tokio_tungstenite::connect_async(&backend_url).await {
+        Ok(s) => s,
+        Err(err) => {
+            error!("❌ WS Connection failed to {backend_url}: {err}");
+            return;
+        }
+    };
+
+    let (mut client_sender, mut client_receiver) = client_socket.split();
+    let (mut backend_sender, mut backend_receiver) = backend_socket.split();
+
+    let mut client_to_server = tokio::spawn(async move {
+        while let Some(Ok(msg)) = client_receiver.next().await {
+            let t_msg = match msg {
+                // FIX: Convert Axum Utf8Bytes -> String -> Tungstenite Message
+                Message::Text(t) => {
+                    tokio_tungstenite::tungstenite::Message::Text(t.to_string().into())
+                }
+                Message::Binary(b) => tokio_tungstenite::tungstenite::Message::Binary(b),
+                Message::Ping(b) => tokio_tungstenite::tungstenite::Message::Ping(b),
+                Message::Pong(b) => tokio_tungstenite::tungstenite::Message::Pong(b),
+                Message::Close(_) => {
+                    let _ = backend_sender.close().await;
+                    break;
+                }
+            };
+
+            if backend_sender.send(t_msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut server_to_client = tokio::spawn(async move {
+        while let Some(Ok(msg)) = backend_receiver.next().await {
+            let a_msg = match msg {
+                tokio_tungstenite::tungstenite::Message::Text(t) => {
+                    Message::Text(t.to_string().into())
+                }
+                tokio_tungstenite::tungstenite::Message::Binary(b) => Message::Binary(b),
+                tokio_tungstenite::tungstenite::Message::Ping(b) => Message::Ping(b),
+                tokio_tungstenite::tungstenite::Message::Pong(b) => Message::Pong(b),
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+            };
+
+            if client_sender.send(a_msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = (&mut client_to_server) => { server_to_client.abort(); },
+        _ = (&mut server_to_client) => { client_to_server.abort(); },
+    };
 }
 
 async fn proxy_request(
