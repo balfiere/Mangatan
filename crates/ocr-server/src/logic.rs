@@ -109,9 +109,24 @@ pub async fn fetch_and_process(
     user: Option<String>,
     pass: Option<String>,
 ) -> anyhow::Result<Vec<OcrResult>> {
+    // 0. Force URL to Localhost
+    // The frontend sends us the URL it uses to view the image (e.g., hostname:4567).
+    // The backend is running in the same context (or container) as Suwayomi.
+    // We rewrite the hostname to 127.0.0.1 to ensure we can reach it internally,
+    // bypassing Docker DNS or proxy issues.
+    let target_url = match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_scheme("http");
+            let _ = parsed.set_host(Some("127.0.0.1"));
+            let _ = parsed.set_port(Some(4567));
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(), // Fallback if parsing fails (unlikely)
+    };
+
     // 1. Fetch
     let client = reqwest::Client::new();
-    let mut req = client.get(url);
+    let mut req = client.get(&target_url); // Use the rewritten URL
     if let Some(u) = user {
         req = req.basic_auth(u, pass);
     }
@@ -119,7 +134,7 @@ pub async fn fetch_and_process(
         .send()
         .await?
         .error_for_status()
-        .map_err(|err| anyhow!("Failed error_for_status: {err:?}"))?;
+        .map_err(|err| anyhow!("Failed error_for_status (URL: {}): {err:?}", target_url))?;
     let bytes = resp.bytes().await?.to_vec();
 
     // 2. Decode Image (With AVIF Fix)
