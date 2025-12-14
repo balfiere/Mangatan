@@ -97,11 +97,30 @@ jobs:
           
           cargo apk build --release
 
+      - name: Locate and Stage APK
+        run: |
+          echo "🔍 Searching for APK..."
+          # Find the APK in the 'target' directory (ignoring intermediates)
+          APK_PATH=$(find target -name "*.apk" | grep "release" | head -n 1)
+          
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ Error: Could not find any APK in 'target/'"
+            find target -name "*.apk" || echo "No APKs found at all."
+            exit 1
+          fi
+          
+          echo "✅ Found APK at: $APK_PATH"
+          
+          # Create a clean directory for the signer
+          mkdir -p signing_stage
+          cp "$APK_PATH" signing_stage/mangatan-unsigned.apk
+          echo "✅ Copied to signing_stage/mangatan-unsigned.apk"
+
       - name: Sign APK
         id: sign_app
         uses: r0adkll/sign-android-release@v1
         with:
-          releaseDirectory: bin/mangatan_android/target/release/apk
+          releaseDirectory: signing_stage
           signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
           alias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
