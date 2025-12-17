@@ -213,8 +213,7 @@ fn android_main(app: AndroidApp) {
     ensure_battery_unrestricted(&app);
     check_and_request_permissions(&app);
     acquire_wifi_lock(&app);
-    post_notification(&app);
-    spawn_notification_retry_logic(app.clone());
+    acquire_wake_lock(&app);
 
     let app_bg = app.clone();
     let files_dir = app.internal_data_path().expect("Failed to get data path");
@@ -1166,122 +1165,6 @@ fn check_and_request_permissions(app: &AndroidApp) {
     }
 }
 
-fn post_notification(app: &AndroidApp) {
-    use jni::objects::{JObject, JValue};
-    let vm_ptr = app.vm_as_ptr() as *mut jni::sys::JavaVM;
-    let vm = unsafe { JavaVM::from_raw(vm_ptr).unwrap() };
-    let mut env = vm.attach_current_thread().unwrap();
-
-    let activity_ptr = app.activity_as_ptr() as jni::sys::jobject;
-    let context = unsafe { JObject::from_raw(activity_ptr) };
-
-    let channel_id = env.new_string("mangatan_server_channel").unwrap();
-    let channel_name = env.new_string("Mangatan Server").unwrap();
-
-    // 1. Create Notification Channel (Required for Android 8+)
-    let notif_manager_cls = env.find_class("android/app/NotificationManager").unwrap();
-    let importance_low = 2; // IMPORTANCE_LOW (No sound, but visible)
-
-    let channel_cls = env.find_class("android/app/NotificationChannel").unwrap();
-    let channel = env
-        .new_object(
-            &channel_cls,
-            "(Ljava/lang/String;Ljava/lang/CharSequence;I)V",
-            &[
-                JValue::Object(&channel_id),
-                JValue::Object(&channel_name),
-                JValue::Int(importance_low),
-            ],
-        )
-        .unwrap();
-
-    let notif_service_str = env.new_string("notification").unwrap();
-    let notif_manager = env
-        .call_method(
-            &context,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-            &[JValue::Object(&notif_service_str)],
-        )
-        .unwrap()
-        .l()
-        .unwrap();
-
-    let _ = env
-        .call_method(
-            &notif_manager,
-            "createNotificationChannel",
-            "(Landroid/app/NotificationChannel;)V",
-            &[JValue::Object(&channel)],
-        )
-        .unwrap();
-
-    // 2. Build Notification
-    let builder_cls = env.find_class("android/app/Notification$Builder").unwrap();
-    let builder = env
-        .new_object(
-            &builder_cls,
-            "(Landroid/content/Context;Ljava/lang/String;)V",
-            &[JValue::Object(&context), JValue::Object(&channel_id)],
-        )
-        .unwrap();
-
-    let title = env.new_string("Mangatan Server Running").unwrap();
-    let text = env.new_string("Tap to return to app").unwrap();
-    let icon_id = 17301659; // android.R.drawable.ic_dialog_info (Generic icon)
-
-    let _ = env
-        .call_method(
-            &builder,
-            "setContentTitle",
-            "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;",
-            &[JValue::Object(&title)],
-        )
-        .unwrap();
-    let _ = env
-        .call_method(
-            &builder,
-            "setContentText",
-            "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;",
-            &[JValue::Object(&text)],
-        )
-        .unwrap();
-    let _ = env
-        .call_method(
-            &builder,
-            "setSmallIcon",
-            "(I)Landroid/app/Notification$Builder;",
-            &[JValue::Int(icon_id)],
-        )
-        .unwrap();
-    let _ = env
-        .call_method(
-            &builder,
-            "setOngoing",
-            "(Z)Landroid/app/Notification$Builder;",
-            &[JValue::Bool(1)],
-        )
-        .unwrap();
-
-    let notification = env
-        .call_method(&builder, "build", "()Landroid/app/Notification;", &[])
-        .unwrap()
-        .l()
-        .unwrap();
-
-    // 3. Show it
-    let _ = env
-        .call_method(
-            &notif_manager,
-            "notify",
-            "(ILandroid/app/Notification;)V",
-            &[JValue::Int(1), JValue::Object(&notification)],
-        )
-        .unwrap();
-
-    info!("✅ Permanent Notification Posted");
-}
-
 fn acquire_wifi_lock(app: &AndroidApp) {
     use jni::objects::{JObject, JValue};
 
@@ -1329,41 +1212,45 @@ fn acquire_wifi_lock(app: &AndroidApp) {
     info!("✅ WifiLock Acquired!");
 }
 
-fn spawn_notification_retry_logic(app: AndroidApp) {
-    thread::spawn(move || {
-        let vm_ptr = app.vm_as_ptr() as *mut jni::sys::JavaVM;
-        let vm = unsafe { JavaVM::from_raw(vm_ptr).unwrap() };
+fn acquire_wake_lock(app: &AndroidApp) {
+    use jni::objects::{JObject, JValue};
 
-        for _ in 0..20 {
-            thread::sleep(Duration::from_secs(5));
+    info!("Acquiring Partial WakeLock...");
+    let vm_ptr = app.vm_as_ptr() as *mut jni::sys::JavaVM;
+    let vm = unsafe { JavaVM::from_raw(vm_ptr).unwrap() };
+    let mut env = vm.attach_current_thread().unwrap();
 
-            let mut env = vm.attach_current_thread().unwrap();
-            let context = unsafe { JObject::from_raw(app.activity_as_ptr() as jobject) };
+    let activity_ptr = app.activity_as_ptr() as jni::sys::jobject;
+    let context = unsafe { JObject::from_raw(activity_ptr) };
 
-            // Check if we have permission now
-            let notif_perm = env
-                .new_string("android.permission.POST_NOTIFICATIONS")
-                .unwrap();
-            let check_res = env
-                .call_method(
-                    &context,
-                    "checkSelfPermission",
-                    "(Ljava/lang/String;)I",
-                    &[JValue::Object(&notif_perm)],
-                )
-                .unwrap()
-                .i()
-                .unwrap();
+    let power_service_str = env.new_string("power").unwrap();
+    let power_manager = env
+        .call_method(
+            &context,
+            "getSystemService",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[JValue::Object(&power_service_str)],
+        )
+        .unwrap()
+        .l()
+        .unwrap();
 
-            if check_res == 0 {
-                // Permission Granted! Post and exit thread.
-                info!("Permission granted detected. Posting notification now.");
-                post_notification(&app);
-                return;
-            } else {
-                info!("Waiting for user to grant notification permission...");
-            }
-        }
-        info!("Stopped waiting for notification permission.");
-    });
+    let tag = env.new_string("Mangatan:CpuLock").unwrap();
+    let wake_lock = env
+        .call_method(
+            &power_manager,
+            "newWakeLock",
+            "(ILjava/lang/String;)Landroid/os/PowerManager$WakeLock;",
+            &[JValue::Int(1), JValue::Object(&tag)],
+        )
+        .unwrap()
+        .l()
+        .unwrap();
+
+    // 3. Acquire
+    let _ = env.call_method(&wake_lock, "acquire", "()V", &[]);
+
+    let _ = env.new_global_ref(&wake_lock).unwrap();
+
+    info!("✅ Partial WakeLock Acquired!");
 }
