@@ -94,7 +94,7 @@ int main(int argc, char * argv[]) {
     [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
 
     JavaVMInitArgs vm_args;
-    JavaVMOption options[31];
+    JavaVMOption options[33];
     int optCount = 0;
 
     options[optCount++].optionString = strdup([[NSString stringWithFormat:@"-Djava.home=%@", libPath] UTF8String]);
@@ -107,6 +107,8 @@ int main(int argc, char * argv[]) {
     options[optCount++].optionString = strdup([[NSString stringWithFormat:@"-Djava.io.tmpdir=%@", tmpDir] UTF8String]);
     
     options[optCount++].optionString = "-Djava.awt.headless=true";
+    options[optCount++].optionString = "-Xverify:none";
+    options[optCount++].optionString = "-XX:+UseSerialGC";
     options[optCount++].optionString = "-Dos.name=Linux";
     options[optCount++].optionString = "-Dos.version=5.15.0";
     options[optCount++].optionString = "-Dos.arch=aarch64";
