@@ -205,21 +205,21 @@ download_jar:
 	@echo "Downloading Suwayomi Server JAR..."
 	mkdir -p bin/mangatan/resources
 	rm -f bin/mangatan/resources/Suwayomi-Server.jar
-	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2031/Suwayomi-Server-v2.1.2031.jar" -o bin/mangatan/resources/Suwayomi-Server.jar
+	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2038/Suwayomi-Server-v2.1.2038.jar" -o bin/mangatan/resources/Suwayomi-Server.jar
 
 .PHONY: download_android_jar
 download_android_jar:
 	@echo "Downloading Android Suwayomi Server JAR..."
 	mkdir -p bin/mangatan_android/assets
 	rm -f bin/mangatan_android/assets/Suwayomi-Server.jar
-	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2031/Suwayomi-Server-v2.1.2031.jar" -o bin/mangatan_android/assets/Suwayomi-Server.jar
+	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2038/Suwayomi-Server-v2.1.2038.jar" -o bin/mangatan_android/assets/Suwayomi-Server.jar
 
 .PHONY: download_ios_jar
 download_ios_jar:
 	@echo "Downloading iOS Suwayomi Server JAR..."
 	mkdir -p bin/mangatan_ios/Mangatan/jar
 	rm -f bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
-	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2031/Suwayomi-Server-v2.1.2031.jar" -o bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
+	curl -L "https://github.com/Suwayomi/Suwayomi-Server-preview/releases/download/v2.1.2038/Suwayomi-Server-v2.1.2038.jar" -o bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
 
 
 .PHONY: ios_framework
