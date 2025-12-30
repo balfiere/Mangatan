@@ -464,8 +464,9 @@ async fn run_server(
 
     info!("📦 Extracting assets...");
     let jar_name = "Suwayomi-Server.jar";
-    let jar_path = extract_file(&bin_dir, jar_name, JAR_BYTES)
+    let _ = extract_file(&bin_dir, jar_name, JAR_BYTES)
         .map_err(|err| anyhow!("Failed to extract {jar_name} {err:?}"))?;
+    let jar_rel_path = PathBuf::from("bin").join(jar_name);
 
     #[cfg(feature = "embed-jre")]
     {
@@ -494,7 +495,7 @@ async fn run_server(
         .arg("--add-opens=java.desktop/sun.awt=ALL-UNNAMED")
         .arg("--add-opens=java.desktop/javax.swing=ALL-UNNAMED")
         .arg("-jar")
-        .arg(&jar_path)
+        .arg(&jar_rel_path)
         .kill_on_drop(true)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
