@@ -15,6 +15,7 @@ pub async fn run_chapter_job(
     user: Option<String>,
     pass: Option<String>,
     context: String,
+    add_space_on_merge: Option<bool>,
 ) {
     let total = pages.len();
     let job_id = base_url.clone();
@@ -57,7 +58,10 @@ pub async fn run_chapter_job(
                 } else {
                     tracing::info!("[Page {page_id}] Starting fetch_and_process (Async)...");
 
-                    match crate::logic::fetch_and_process(&url, user, pass).await {
+                    // None defaults to Smart Detection for space merging
+                    match crate::logic::fetch_and_process(&url, user, pass, add_space_on_merge)
+                        .await
+                    {
                         Ok(res) => {
                             state.cache.write().expect("lock").insert(
                                 cache_key,

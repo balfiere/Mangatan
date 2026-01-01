@@ -3,6 +3,8 @@ use std::{io::Cursor, time::Duration};
 use anyhow::anyhow;
 use chrome_lens_ocr::LensClient;
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, ImageReader};
+use lazy_static::lazy_static;
+use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
@@ -93,21 +95,21 @@ async fn execute_graphql_request(
     let client = reqwest::Client::new();
     let graphql_url = "http://127.0.0.1:4568/api/graphql";
 
-    let mut req = client
+    let mut request = client
         .post(graphql_url)
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .json(&query_body);
 
-    if let Some(u) = user {
-        req = req.basic_auth(u, pass);
+    if let Some(username) = user {
+        request = request.basic_auth(username, pass);
     }
 
-    let resp = req.send().await?;
-    let status = resp.status();
+    let response = request.send().await?;
+    let status = response.status();
 
     if !status.is_success() {
-        let body = resp
+        let body = response
             .text()
             .await
             .unwrap_or_else(|_| "[Failed to read body]".to_string());
@@ -116,7 +118,7 @@ async fn execute_graphql_request(
         ));
     }
 
-    Ok(resp)
+    Ok(response)
 }
 
 pub async fn resolve_total_pages_from_graphql(
@@ -130,14 +132,14 @@ pub async fn resolve_total_pages_from_graphql(
 
     let manga_id_str = parts
         .iter()
-        .find(|&p| *p == "manga")
-        .and_then(|_| parts.get(parts.iter().position(|&p| p == "manga")? + 1))
+        .find(|&part| *part == "manga")
+        .and_then(|_| parts.get(parts.iter().position(|&part| part == "manga")? + 1))
         .ok_or_else(|| anyhow!("Failed to parse manga ID from URL: {chapter_base_url}"))?;
 
     let chapter_number_str = parts
         .iter()
-        .find(|&p| *p == "chapter")
-        .and_then(|_| parts.get(parts.iter().position(|&p| p == "chapter")? + 1))
+        .find(|&part| *part == "chapter")
+        .and_then(|_| parts.get(parts.iter().position(|&part| part == "chapter")? + 1))
         .ok_or_else(|| anyhow!("Failed to parse chapter number from URL: {chapter_base_url}"))?;
 
     let manga_id = manga_id_str.parse::<i32>()?;
@@ -149,22 +151,22 @@ pub async fn resolve_total_pages_from_graphql(
         "query": MANGA_CHAPTERS_QUERY,
     });
 
-    let resp = execute_graphql_request(query_body, user.clone(), pass.clone()).await?;
+    let response = execute_graphql_request(query_body, user.clone(), pass.clone()).await?;
 
-    let json: ChapterPageCountResponse = resp
+    let json_response: ChapterPageCountResponse = response
         .json()
         .await
         .map_err(|err| anyhow!("Error decoding STEP 1 GraphQL response: {err}"))?;
 
-    let chapters: Vec<ChapterNode> = json
+    let chapters: Vec<ChapterNode> = json_response
         .data
-        .and_then(|d| d.manga)
-        .and_then(|m| m.chapters)
-        .and_then(|c| c.nodes)
+        .and_then(|data| data.manga)
+        .and_then(|manga| manga.chapters)
+        .and_then(|chapters| chapters.nodes)
         .ok_or_else(|| anyhow!("GraphQL STEP 1 response missing chapter nodes"))?;
 
-    let has_chapter_zero = chapters.iter().any(|ch| ch.chapter_number == 0.0);
-    let target_chapter_num = if has_chapter_zero {
+    let has_chapter_zero = chapters.iter().any(|chapter| chapter.chapter_number == 0.0);
+    let target_chapter_number = if has_chapter_zero {
         chapter_number - 1.0
     } else {
         chapter_number
@@ -172,10 +174,10 @@ pub async fn resolve_total_pages_from_graphql(
 
     let matching_chapter = chapters
         .into_iter()
-        .find(|ch| (ch.chapter_number - target_chapter_num).abs() < 0.001);
+        .find(|chapter| (chapter.chapter_number - target_chapter_number).abs() < 0.001);
 
-    let internal_chapter_id = matching_chapter.map(|ch| ch.id).ok_or_else(|| {
-        anyhow!("Failed to find internal ID for chapter number {target_chapter_num}")
+    let internal_chapter_id = matching_chapter.map(|chapter| chapter.id).ok_or_else(|| {
+        anyhow!("Failed to find internal ID for chapter number {target_chapter_number}")
     })?;
 
     let mutation_body = serde_json::json!({
@@ -186,18 +188,18 @@ pub async fn resolve_total_pages_from_graphql(
         "query": GET_CHAPTER_PAGES_QUERY,
     });
 
-    let resp = execute_graphql_request(mutation_body, user, pass).await?;
+    let response = execute_graphql_request(mutation_body, user, pass).await?;
 
-    let json: FetchPagesResponse = resp
+    let json_response: FetchPagesResponse = response
         .json()
         .await
         .map_err(|err| anyhow!("Error decoding STEP 2 GraphQL response: {err}"))?;
 
-    let page_count = json
+    let page_count = json_response
         .data
-        .and_then(|d| d.fetch_chapter_pages)
-        .and_then(|f| f.chapter)
-        .and_then(|c| c.page_count)
+        .and_then(|data| data.fetch_chapter_pages)
+        .and_then(|fetch| fetch.chapter)
+        .and_then(|chapter| chapter.page_count)
         .ok_or_else(|| anyhow!("GraphQL STEP 2 response missing page count"))?;
 
     Ok(page_count)
@@ -217,12 +219,14 @@ pub struct OcrResult {
     pub forced_orientation: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct BoundingBox {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f64>, // Kept for type compatibility, but will be None/0.0
 }
 
 /// Helper to strip the scheme/host/query from the URL for caching purposes.
@@ -231,6 +235,21 @@ pub fn get_cache_key(url: &str) -> String {
         return parsed.path().to_string();
     }
     url.split('?').next().unwrap_or(url).to_string()
+}
+
+lazy_static! {
+    // Matches CJK characters (Kanji, Hiragana, Katakana)
+    static ref CJK_REGEX: Regex = Regex::new(r"[\p{Han}\p{Hiragana}\p{Katakana}]").unwrap();
+}
+
+/// Cleans up text based on content.
+/// If the text contains CJK characters, it strips whitespace (Lens adds artificial spaces).
+fn post_process_text(text: String) -> String {
+    if CJK_REGEX.is_match(&text) {
+        text.replace(char::is_whitespace, "")
+    } else {
+        text
+    }
 }
 
 fn decode_avif_custom(bytes: &[u8]) -> anyhow::Result<DynamicImage> {
@@ -295,27 +314,35 @@ pub async fn fetch_and_process(
     url: &str,
     user: Option<String>,
     pass: Option<String>,
+    add_space_on_merge: Option<bool>,
 ) -> anyhow::Result<Vec<OcrResult>> {
-    let mut last_err = anyhow!("Unknown error");
+    let mut last_error = anyhow!("Unknown error");
 
     // Try up to 3 times on Android
-    for attempt in 1..=3 {
-        match fetch_and_process_internal(url, user.clone(), pass.clone()).await {
-            Ok(res) => return Ok(res),
-            Err(e) => {
-                last_err = e;
-                tracing::warn!("Attempt {} failed for {}: {:?}", attempt, url, last_err);
-                tokio::time::sleep(Duration::from_secs(attempt)).await;
+    for attempt_number in 1..=3 {
+        match fetch_and_process_internal(url, user.clone(), pass.clone(), add_space_on_merge).await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                last_error = error;
+                tracing::warn!(
+                    "Attempt {} failed for {}: {:?}",
+                    attempt_number,
+                    url,
+                    last_error
+                );
+                tokio::time::sleep(Duration::from_secs(attempt_number)).await;
             }
         }
     }
-    Err(last_err)
+    Err(last_error)
 }
 
 async fn fetch_and_process_internal(
     url: &str,
     user: Option<String>,
     pass: Option<String>,
+    add_space_on_merge: Option<bool>,
 ) -> anyhow::Result<Vec<OcrResult>> {
     // 0. Force URL to Localhost
     let target_url = match reqwest::Url::parse(url) {
@@ -330,126 +357,178 @@ async fn fetch_and_process_internal(
 
     // 1. Fetch
     let client = reqwest::Client::new();
-    let mut req = client.get(&target_url);
-    if let Some(u) = user {
-        req = req.basic_auth(u, pass);
+    let mut request = client.get(&target_url);
+    if let Some(username) = user {
+        request = request.basic_auth(username, pass);
     }
-    let resp = req
+    let response = request
         .send()
         .await?
         .error_for_status()
         .map_err(|err| anyhow!("Failed error_for_status (URL: {target_url}): {err:?}"))?;
-    let bytes = resp.bytes().await?.to_vec();
+    let image_bytes = response.bytes().await?.to_vec();
 
     // 2. Decode Image (With AVIF Fix)
     // We guess the format first. If it is AVIF, we use our custom function.
-    let reader = ImageReader::new(Cursor::new(&bytes))
+    let reader = ImageReader::new(Cursor::new(&image_bytes))
         .with_guessed_format()
         .map_err(|err| anyhow!("Failed with_guessed_format: {err:?}"))?;
 
-    let img = if reader.format() == Some(ImageFormat::Avif) {
-        decode_avif_custom(&bytes)?
+    let decoded_image = if reader.format() == Some(ImageFormat::Avif) {
+        decode_avif_custom(&image_bytes)?
     } else {
         reader
             .decode()
             .map_err(|err| anyhow!("Failed decode: {err:?}"))?
     };
 
-    let full_w = img.width();
-    let full_h = img.height();
-    let chunk_h_limit = 3000;
+    let full_image_width = decoded_image.width();
+    let full_image_height = decoded_image.height();
+    let chunk_height_limit = 3000;
 
     let mut final_results = Vec::new();
     let lens_client = LensClient::new(None);
 
     // 3. Chunking Loop
-    let mut y_curr = 0;
-    while y_curr < full_h {
-        let h_curr = std::cmp::min(chunk_h_limit, full_h - y_curr);
-        if h_curr == 0 {
+    let mut current_y_position = 0;
+    while current_y_position < full_image_height {
+        let current_chunk_height =
+            std::cmp::min(chunk_height_limit, full_image_height - current_y_position);
+        if current_chunk_height == 0 {
             break;
         }
 
-        let chunk_img = img.view(0, y_curr, full_w, h_curr).to_image();
-        let mut buf = Cursor::new(Vec::new());
-        chunk_img
-            .write_to(&mut buf, ImageFormat::Png)
+        let chunk_image = decoded_image
+            .view(
+                0,
+                current_y_position,
+                full_image_width,
+                current_chunk_height,
+            )
+            .to_image();
+        let mut image_buffer = Cursor::new(Vec::new());
+        chunk_image
+            .write_to(&mut image_buffer, ImageFormat::Png)
             .map_err(|err| anyhow!("Failed write_to: {err:?}"))?;
-        let chunk_bytes = buf.into_inner();
+        let chunk_png_bytes = image_buffer.into_inner();
 
         // 4. Call Lens
-        let lens_res = lens_client
-            .process_image_bytes(&chunk_bytes, Some("jp"))
+        let lens_response = lens_client
+            .process_image_bytes(&chunk_png_bytes, Some("jp"))
             .await
             .map_err(|err| anyhow!("Failed process_image_bytes: {err:?}"))?;
 
         // 5. Flatten LensResult & Convert Normalized Coords to Chunk Pixels
-        let mut flat_lines = Vec::new();
-        for para in lens_res.paragraphs {
-            for line in para.lines {
-                if let Some(geom) = line.geometry {
-                    // Lens returns normalized coords (0.0 - 1.0) relative to the chunk.
-                    // We must convert them to pixels for the auto_merge logic to work.
+        let mut flat_ocr_lines = Vec::new();
+        for paragraph in lens_response.paragraphs {
+            for line in paragraph.lines {
+                if let Some(geometry) = line.geometry {
+                    // Normalize text immediately
+                    let clean_text = post_process_text(line.text);
+                    if clean_text.trim().is_empty() {
+                        continue;
+                    }
 
-                    let norm_x = (geom.center_x - geom.width / 2.0) as f64;
-                    let norm_y = (geom.center_y - geom.height / 2.0) as f64;
-                    let norm_w = geom.width as f64;
-                    let norm_h = geom.height as f64;
+                    // --- FIX: CALCULATE AABB FROM ROTATED RECT ---
+                    // Lens gives us Center, Width, Height, and Rotation.
+                    // To get a non-rotated box that fits, we must calculate the corners
+                    // and find the min/max X/Y.
 
-                    // Convert to Chunk Pixels
-                    let px_x = norm_x * full_w as f64;
-                    let px_y = norm_y * h_curr as f64;
-                    let px_w = norm_w * full_w as f64;
-                    let px_h = norm_h * h_curr as f64;
+                    let rotation = geometry.rotation_z as f64;
+                    let cx = (geometry.center_x * full_image_width as f32) as f64;
+                    let cy = (geometry.center_y * current_chunk_height as f32) as f64;
+                    let w = (geometry.width * full_image_width as f32) as f64;
+                    let h = (geometry.height * current_chunk_height as f32) as f64;
 
-                    // Logic from JS `_groupOcrData`: isVertical = width <= height
-                    let is_vertical = px_w <= px_h;
-                    let orientation = if is_vertical {
+                    // Calculate corners of rotated rect
+                    let hw = w / 2.0;
+                    let hh = h / 2.0;
+                    let cos_a = rotation.cos();
+                    let sin_a = rotation.sin();
+
+                    let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+
+                    let mut min_x = f64::INFINITY;
+                    let mut max_x = f64::NEG_INFINITY;
+                    let mut min_y = f64::INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+
+                    for (lx, ly) in corners {
+                        let rx = lx * cos_a - ly * sin_a + cx;
+                        let ry = lx * sin_a + ly * cos_a + cy;
+                        min_x = min_x.min(rx);
+                        max_x = max_x.max(rx);
+                        min_y = min_y.min(ry);
+                        max_y = max_y.max(ry);
+                    }
+
+                    let aabb_w = max_x - min_x;
+                    let aabb_h = max_y - min_y;
+
+                    // Improved vertical detection:
+                    // If rotation is roughly +/- 90deg (1.57 rad), it's vertical.
+                    let is_vertical = if rotation.abs() > 0.1 {
+                        (rotation.abs() - std::f32::consts::FRAC_PI_2 as f64).abs() < 0.5
+                    } else {
+                        // Fallback to aspect ratio if rotation is near zero
+                        aabb_w <= aabb_h
+                    };
+
+                    let orientation_string = if is_vertical {
                         "vertical"
                     } else {
                         "horizontal"
                     }
                     .to_string();
 
-                    flat_lines.push(OcrResult {
-                        text: line.text,
+                    flat_ocr_lines.push(OcrResult {
+                        text: clean_text,
                         is_merged: Some(false),
-                        forced_orientation: Some(orientation),
+                        forced_orientation: Some(orientation_string),
                         tight_bounding_box: BoundingBox {
-                            x: px_x,
-                            y: px_y,
-                            width: px_w,
-                            height: px_h,
+                            x: min_x,
+                            y: min_y,
+                            width: aabb_w,
+                            height: aabb_h,
+                            rotation: None, // FORCE NO ROTATION
                         },
                     });
                 }
             }
         }
 
-        // 6. Auto Merge (Operates on Pixels)
-        let merged = merge::auto_merge(flat_lines, full_w, h_curr, &MergeConfig::default());
+        // 6. Auto Merge
+        let mut merge_config = MergeConfig::default();
+        merge_config.add_space_on_merge = add_space_on_merge;
+
+        let merged_lines = merge::auto_merge(
+            flat_ocr_lines,
+            full_image_width,
+            current_chunk_height,
+            &merge_config,
+        );
 
         // 7. Adjust Coordinates: Chunk Pixels -> Global Pixels -> Global Normalized
-        for mut res in merged {
+        for mut result in merged_lines {
             // 1. Get Chunk Pixels (Result from merge is still in pixels relative to chunk)
-            let x_chunk_px = res.tight_bounding_box.x;
-            let y_chunk_px = res.tight_bounding_box.y;
-            let w_chunk_px = res.tight_bounding_box.width;
-            let h_chunk_px = res.tight_bounding_box.height;
+            let chunk_pixel_x = result.tight_bounding_box.x;
+            let chunk_pixel_y = result.tight_bounding_box.y;
+            let chunk_pixel_width = result.tight_bounding_box.width;
+            let chunk_pixel_height = result.tight_bounding_box.height;
 
             // 2. Convert to Global Pixels
-            let y_global_px = y_chunk_px + (y_curr as f64);
+            let global_pixel_y = chunk_pixel_y + (current_y_position as f64);
 
             // 3. Normalize to Global Image (0.0 - 1.0)
-            res.tight_bounding_box.x = x_chunk_px / full_w as f64;
-            res.tight_bounding_box.width = w_chunk_px / full_w as f64;
-            res.tight_bounding_box.y = y_global_px / full_h as f64;
-            res.tight_bounding_box.height = h_chunk_px / full_h as f64;
+            result.tight_bounding_box.x = chunk_pixel_x / full_image_width as f64;
+            result.tight_bounding_box.width = chunk_pixel_width / full_image_width as f64;
+            result.tight_bounding_box.y = global_pixel_y / full_image_height as f64;
+            result.tight_bounding_box.height = chunk_pixel_height / full_image_height as f64;
 
-            final_results.push(res);
+            final_results.push(result);
         }
 
-        y_curr += chunk_h_limit;
+        current_y_position += chunk_height_limit;
     }
 
     Ok(final_results)

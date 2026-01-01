@@ -3633,6 +3633,8 @@ dependencies = [
  "chrome_lens_ocr",
  "futures",
  "image",
+ "lazy_static",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

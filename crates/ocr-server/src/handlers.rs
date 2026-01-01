@@ -20,6 +20,7 @@ pub struct OcrRequest {
     pub pass: Option<String>,
     #[serde(default = "default_context")]
     pub context: String,
+    pub add_space_on_merge: Option<bool>,
 }
 
 fn default_context() -> String {
@@ -57,8 +58,13 @@ pub async fn ocr_handler(
         cache_key
     );
 
-    let result =
-        logic::fetch_and_process(&params.url, params.user.clone(), params.pass.clone()).await;
+    let result = logic::fetch_and_process(
+        &params.url,
+        params.user.clone(),
+        params.pass.clone(),
+        params.add_space_on_merge,
+    )
+    .await;
 
     match result {
         Ok(data) => {
@@ -105,6 +111,7 @@ pub struct JobRequest {
     pub pass: Option<String>,
     pub context: String,
     pub pages: Option<Vec<String>>,
+    pub add_space_on_merge: Option<bool>,
 }
 
 pub async fn is_chapter_preprocessed_handler(
@@ -207,6 +214,7 @@ pub async fn preprocess_handler(
             req.user,
             req.pass,
             req.context,
+            req.add_space_on_merge,
         )
         .await;
     });

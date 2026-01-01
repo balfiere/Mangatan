@@ -1,65 +1,265 @@
+use lazy_static::lazy_static;
+use regex::Regex;
 use std::cmp::Ordering;
 
 use crate::logic::{BoundingBox, OcrResult};
 
+lazy_static! {
+    static ref JAPANESE_REGEX: Regex = Regex::new(r"[\p{Hiragana}\p{Katakana}\p{Han}]").unwrap();
+    static ref NO_SPACE_LANGUAGE_REGEX: Regex =
+        Regex::new(r"[\p{Hiragana}\p{Katakana}\p{Han}]").unwrap();
+    static ref LINE_NOISE_REGEX: Regex = Regex::new(r"^[|—_ノヘく/\\:;]$").unwrap();
+    static ref KANA_ONLY_REGEX: Regex = Regex::new(r"^[\p{Hiragana}\p{Katakana}]$").unwrap();
+}
+
 #[derive(Clone)]
 pub struct MergeConfig {
     pub enabled: bool,
-    pub dist_k: f64,
-    pub font_ratio: f64,
-    pub perp_tol: f64,
-    pub overlap_min: f64,
-    pub min_line_ratio: f64,
-    pub font_ratio_for_mixed: f64,
-    pub mixed_min_overlap_ratio: f64,
-    pub add_space_on_merge: bool,
+    pub font_size_ratio: f64,
+    pub add_space_on_merge: Option<bool>,
 }
 
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            dist_k: 1.2,
-            font_ratio: 1.3,
-            perp_tol: 0.5,
-            overlap_min: 0.1,
-            min_line_ratio: 0.5,
-            font_ratio_for_mixed: 1.1,
-            mixed_min_overlap_ratio: 0.5,
-            add_space_on_merge: false,
+            font_size_ratio: 1.5,
+            add_space_on_merge: None,
         }
     }
 }
 
-// Internal structures for calculation
-struct ProcessedLine {
-    original_index: usize,
-    is_vertical: bool,
-    font_size: f64,
-    bbox: NormBbox,
-    pixel_top: f64,
-    pixel_bottom: f64,
-}
+// --- Geometry Helpers ---
 
-struct NormBbox {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Point {
     x: f64,
     y: f64,
-    width: f64,
-    height: f64,
-    right: f64,
-    bottom: f64,
+}
+
+fn get_bounding_box_corners(bbox: &BoundingBox) -> Vec<Point> {
+    let center_x = bbox.x + bbox.width / 2.0;
+    let center_y = bbox.y + bbox.height / 2.0;
+    let half_width = bbox.width / 2.0;
+    let half_height = bbox.height / 2.0;
+    let rotation = bbox.rotation.unwrap_or(0.0);
+
+    let corners = vec![
+        Point {
+            x: -half_width,
+            y: -half_height,
+        },
+        Point {
+            x: half_width,
+            y: -half_height,
+        },
+        Point {
+            x: half_width,
+            y: half_height,
+        },
+        Point {
+            x: -half_width,
+            y: half_height,
+        },
+    ];
+
+    let cos_angle = rotation.cos();
+    let sin_angle = rotation.sin();
+
+    corners
+        .into_iter()
+        .map(|point| Point {
+            x: point.x * cos_angle - point.y * sin_angle + center_x,
+            y: point.x * sin_angle + point.y * cos_angle + center_y,
+        })
+        .collect()
+}
+
+fn calculate_aabb(points: &[Point]) -> (f64, f64, f64, f64, f64) {
+    if points.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let min_x = points.iter().fold(f64::INFINITY, |a, b| a.min(b.x));
+    let max_x = points.iter().fold(f64::NEG_INFINITY, |a, b| a.max(b.x));
+    let min_y = points.iter().fold(f64::INFINITY, |a, b| a.min(b.y));
+    let max_y = points.iter().fold(f64::NEG_INFINITY, |a, b| a.max(b.y));
+
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    let center_x = min_x + width / 2.0;
+    let center_y = min_y + height / 2.0;
+
+    (center_x, center_y, width, height, 0.0)
+}
+
+// --- Pre-Processing Filters ---
+
+fn filter_bad_boxes(lines: Vec<OcrResult>, page_w: u32, page_h: u32) -> Vec<OcrResult> {
+    let mut keep = vec![true; lines.len()];
+    let n = lines.len();
+    let page_area = (page_w as f64) * (page_h as f64);
+
+    // 1. Noise & SFX Filter
+    for i in 0..n {
+        let l = &lines[i];
+        let text = l.text.trim();
+        let text_len = text.chars().count();
+        let box_area = l.tight_bounding_box.width * l.tight_bounding_box.height;
+
+        // Rule A: Single Character Filtering
+        if text_len == 1 {
+            let ch = text.chars().next().unwrap();
+            if ch.is_ascii_punctuation() || ch.is_ascii_digit() {
+                keep[i] = false;
+                continue;
+            }
+            if KANA_ONLY_REGEX.is_match(text) {
+                keep[i] = false;
+                continue;
+            }
+            if LINE_NOISE_REGEX.is_match(text) {
+                keep[i] = false;
+                continue;
+            }
+        }
+
+        // Rule B: Tiny Speck Filter (0.05%)
+        if box_area < page_area * 0.0005 {
+            keep[i] = false;
+            continue;
+        }
+
+        // Rule C: Sound Effect (SFX) Filter
+        if box_area > page_area * 0.30 && text_len < 6 {
+            keep[i] = false;
+            continue;
+        }
+    }
+
+    // 2. Overlap / Ghost Detection
+    for i in 0..n {
+        if !keep[i] {
+            continue;
+        }
+        for j in 0..n {
+            if i == j || !keep[j] {
+                continue;
+            }
+
+            let a = &lines[i];
+            let b = &lines[j];
+
+            let x_overlap = (a.tight_bounding_box.x + a.tight_bounding_box.width)
+                .min(b.tight_bounding_box.x + b.tight_bounding_box.width)
+                - a.tight_bounding_box.x.max(b.tight_bounding_box.x);
+            let y_overlap = (a.tight_bounding_box.y + a.tight_bounding_box.height)
+                .min(b.tight_bounding_box.y + b.tight_bounding_box.height)
+                - a.tight_bounding_box.y.max(b.tight_bounding_box.y);
+
+            if x_overlap > 0.0 && y_overlap > 0.0 {
+                let intersection_area = x_overlap * y_overlap;
+                let b_area = b.tight_bounding_box.width * b.tight_bounding_box.height;
+
+                if intersection_area > b_area * 0.3 {
+                    // Vertical > Horizontal
+                    if a.forced_orientation.as_deref() == Some("vertical")
+                        && b.forced_orientation.as_deref() == Some("horizontal")
+                    {
+                        keep[j] = false;
+                        continue;
+                    }
+                    let a_area = a.tight_bounding_box.width * a.tight_bounding_box.height;
+                    if a_area > b_area * 3.0 && intersection_area > b_area * 0.8 {
+                        keep[j] = false;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Furigana Check
+    for i in 0..n {
+        if !keep[i] {
+            continue;
+        }
+        for j in 0..n {
+            if i == j || !keep[j] {
+                continue;
+            }
+
+            let main = &lines[i];
+            let sub = &lines[j];
+
+            let main_font = if main.forced_orientation.as_deref() == Some("vertical") {
+                main.tight_bounding_box.width
+            } else {
+                main.tight_bounding_box.height
+            };
+            let sub_font = if sub.forced_orientation.as_deref() == Some("vertical") {
+                sub.tight_bounding_box.width
+            } else {
+                sub.tight_bounding_box.height
+            };
+
+            if sub_font > main_font * 0.55 {
+                continue;
+            }
+
+            let is_furigana = if main.forced_orientation.as_deref() == Some("vertical") {
+                let x_gap = sub.tight_bounding_box.x
+                    - (main.tight_bounding_box.x + main.tight_bounding_box.width);
+                let y_overlap = (main.tight_bounding_box.y + main.tight_bounding_box.height)
+                    .min(sub.tight_bounding_box.y + sub.tight_bounding_box.height)
+                    - main.tight_bounding_box.y.max(sub.tight_bounding_box.y);
+                x_gap > -main_font * 0.2
+                    && x_gap < main_font * 1.5
+                    && y_overlap > sub.tight_bounding_box.height * 0.5
+            } else {
+                let y_gap = main.tight_bounding_box.y
+                    - (sub.tight_bounding_box.y + sub.tight_bounding_box.height);
+                let x_overlap = (main.tight_bounding_box.x + main.tight_bounding_box.width)
+                    .min(sub.tight_bounding_box.x + sub.tight_bounding_box.width)
+                    - main.tight_bounding_box.x.max(sub.tight_bounding_box.x);
+                y_gap > -main_font * 0.2
+                    && y_gap < main_font * 1.5
+                    && x_overlap > sub.tight_bounding_box.width * 0.5
+            };
+
+            if is_furigana {
+                keep[j] = false;
+            }
+        }
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, l)| l)
+        .collect()
+}
+
+// --- Dynamic Merging Logic ---
+
+struct ProcessedLine {
+    is_vertical: bool,
+    font_size: f64,
+    length_main: f64,
+    min_main: f64,
+    max_main: f64,
+    min_cross: f64,
+    max_cross: f64,
 }
 
 struct UnionFind {
     parent: Vec<usize>,
-    rank: Vec<usize>,
 }
-
 impl UnionFind {
-    fn new(size: usize) -> Self {
+    fn new(n: usize) -> Self {
         Self {
-            parent: (0..size).collect(),
-            rank: vec![0; size],
+            parent: (0..n).collect(),
         }
     }
     fn find(&mut self, i: usize) -> usize {
@@ -72,307 +272,243 @@ impl UnionFind {
         let root_i = self.find(i);
         let root_j = self.find(j);
         if root_i != root_j {
-            match self.rank[root_i].cmp(&self.rank[root_j]) {
-                Ordering::Greater => self.parent[root_j] = root_i,
-                Ordering::Less => self.parent[root_i] = root_j,
-                Ordering::Equal => {
-                    self.parent[root_j] = root_i;
-                    self.rank[root_i] += 1;
-                }
-            }
+            self.parent[root_i] = root_j;
         }
     }
 }
 
-fn median(data: &[f64]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
+fn are_lines_mergeable(a: &ProcessedLine, b: &ProcessedLine, config: &MergeConfig) -> bool {
+    // 1. Orientation check
+    if a.is_vertical != b.is_vertical {
+        return false;
     }
-    let mut s = data.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let mid = s.len() / 2;
-    // FIX: used is_multiple_of
-    if s.len().is_multiple_of(2) {
-        (s[mid - 1] + s[mid]) / 2.0
-    } else {
-        s[mid]
+
+    // 2. Font size check
+    let max_font = a.font_size.max(b.font_size);
+    let min_font = a.font_size.min(b.font_size);
+    if max_font / min_font > config.font_size_ratio {
+        return false;
     }
+
+    // 3. Sidebar Protection
+    let overlap_main = 0.0f64.max(a.max_main.min(b.max_main) - a.min_main.max(b.min_main));
+    if overlap_main > 0.0 {
+        let max_len = a.length_main.max(b.length_main);
+        let min_len = a.length_main.min(b.length_main);
+        if max_len > min_len * 3.0 {
+            // Must be touching
+            let dist_cross = 0.0f64
+                .max(b.min_cross - a.max_cross)
+                .max(a.min_cross - b.max_cross);
+            if dist_cross > min_font * 0.2 {
+                return false;
+            }
+        }
+    }
+
+    // 4. Dynamic Spacing with STRICT Limit
+    let gap_cross = 0.0f64
+        .max(b.min_cross - a.max_cross)
+        .max(a.min_cross - b.max_cross);
+    let overlap_ratio = overlap_main / a.font_size.max(b.font_size);
+
+    let base_metric = min_font;
+
+    // Hard Limit: Gap > 1.25x font size -> Separate
+    if gap_cross > base_metric * 1.25 {
+        return false;
+    }
+
+    let mut allowed_gap_ratio = 0.8;
+    if overlap_ratio > 0.5 {
+        allowed_gap_ratio += 0.3;
+    }
+
+    if gap_cross > base_metric * allowed_gap_ratio {
+        return false;
+    }
+
+    // 5. Main Axis Proximity
+    if overlap_main <= 0.0 {
+        let gap_main = 0.0f64
+            .max(b.min_main - a.max_main)
+            .max(a.min_main - b.max_main);
+        if gap_main > base_metric * 0.6 {
+            return false;
+        }
+    }
+
+    true
 }
 
 pub fn auto_merge(lines: Vec<OcrResult>, w: u32, h: u32, config: &MergeConfig) -> Vec<OcrResult> {
-    if !config.enabled || lines.len() < 2 {
+    if !config.enabled || lines.is_empty() {
         return lines;
     }
 
-    // 1. Group
-    let groups = group_ocr_data(&lines, w, h, config);
-    let mut final_data = Vec::new();
+    // 1. Filter Noise
+    let clean_lines = filter_bad_boxes(lines, w, h);
 
-    // 2. Merge groups
-    for mut group in groups {
-        if group.len() == 1 {
-            // FIX: used expect instead of unwrap
-            final_data.push(group.pop().expect("group not empty"));
-            continue;
-        }
-
-        let vert_count = group
-            .iter()
-            .filter(|l| l.tight_bounding_box.height > l.tight_bounding_box.width)
-            .count();
-        let is_vert_group = vert_count > group.len() / 2;
-
-        // Sort based on orientation (Replicating JS Logic)
-        group.sort_by(|a, b| {
-            let ba = &a.tight_bounding_box;
-            let bb = &b.tight_bounding_box;
-            if is_vert_group {
-                // Right-to-left primary
-                let ca = ba.x + ba.width / 2.0;
-                let cb = bb.x + bb.width / 2.0;
-                if (ca - cb).abs() > 0.001 {
-                    cb.partial_cmp(&ca).unwrap_or(Ordering::Equal)
-                } else {
-                    (ba.y + ba.height / 2.0)
-                        .partial_cmp(&(bb.y + bb.height / 2.0))
-                        .unwrap_or(Ordering::Equal)
-                }
-            } else {
-                // Top-to-bottom primary
-                let ca = ba.y + ba.height / 2.0;
-                let cb = bb.y + bb.height / 2.0;
-                if (ca - cb).abs() > 0.001 {
-                    ca.partial_cmp(&cb).unwrap_or(Ordering::Equal)
-                } else {
-                    (ba.x + ba.width / 2.0)
-                        .partial_cmp(&(bb.x + bb.width / 2.0))
-                        .unwrap_or(Ordering::Equal)
-                }
-            }
-        });
-
-        let join = if config.add_space_on_merge {
-            " "
-        } else {
-            "\u{200B}"
-        };
-        let text = group
-            .iter()
-            .map(|l| l.text.as_str())
-            .collect::<Vec<_>>()
-            .join(join);
-
-        let min_x = group
-            .iter()
-            .map(|l| l.tight_bounding_box.x)
-            .fold(f64::INFINITY, f64::min);
-        let min_y = group
-            .iter()
-            .map(|l| l.tight_bounding_box.y)
-            .fold(f64::INFINITY, f64::min);
-        let max_r = group
-            .iter()
-            .map(|l| l.tight_bounding_box.x + l.tight_bounding_box.width)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let max_b = group
-            .iter()
-            .map(|l| l.tight_bounding_box.y + l.tight_bounding_box.height)
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        final_data.push(OcrResult {
-            text,
-            is_merged: Some(true),
-            forced_orientation: Some(if is_vert_group {
-                "vertical".into()
-            } else {
-                "horizontal".into()
-            }),
-            tight_bounding_box: BoundingBox {
-                x: min_x,
-                y: min_y,
-                width: max_r - min_x,
-                height: max_b - min_y,
-            },
-        });
-    }
-
-    final_data
-}
-
-fn group_ocr_data(
-    lines: &[OcrResult],
-    w: u32,
-    h: u32,
-    config: &MergeConfig,
-) -> Vec<Vec<OcrResult>> {
-    let wf = w as f64;
-    let hf = h as f64;
-    let norm_scale = 1000.0 / wf;
-
-    // Pre-calc metrics
-    let mut processed: Vec<ProcessedLine> = lines
+    let processed: Vec<ProcessedLine> = clean_lines
         .iter()
-        .enumerate()
-        .map(|(idx, l)| {
+        .map(|l| {
             let b = &l.tight_bounding_box;
-            let nx = b.x * wf * norm_scale;
-            let ny = b.y * hf * norm_scale;
-            let nw = b.width * wf * norm_scale;
-            let nh = b.height * hf * norm_scale;
 
-            let is_v = nw <= nh;
+            // --- NEW ORIENTATION LOGIC ---
+            // If text is NOT Japanese, it MUST be horizontal.
+            let is_japanese = JAPANESE_REGEX.is_match(&l.text);
+
+            let lens_is_vertical = l.forced_orientation.as_deref() == Some("vertical");
+
+            // Final decision: Vertical only if it is Japanese AND Lens thinks it's vertical.
+            // English/Korean/Numbers forced to Horizontal.
+            let is_v = is_japanese && lens_is_vertical;
+
+            let (min_main, max_main, min_cross, max_cross) = if is_v {
+                (b.y, b.y + b.height, b.x, b.x + b.width)
+            } else {
+                (b.x, b.x + b.width, b.y, b.y + b.height)
+            };
 
             ProcessedLine {
-                original_index: idx,
                 is_vertical: is_v,
-                font_size: if is_v { nw } else { nh },
-                bbox: NormBbox {
-                    x: nx,
-                    y: ny,
-                    width: nw,
-                    height: nh,
-                    right: nx + nw,
-                    bottom: ny + nh,
-                },
-                pixel_top: b.y * hf,
-                pixel_bottom: (b.y + b.height) * hf,
+                font_size: if is_v { b.width } else { b.height },
+                length_main: if is_v { b.height } else { b.width },
+                min_main,
+                max_main,
+                min_cross,
+                max_cross,
             }
         })
         .collect();
 
-    processed.sort_by(|a, b| {
-        a.pixel_top
-            .partial_cmp(&b.pixel_top)
-            .unwrap_or(Ordering::Equal)
-    });
-
-    let mut all_groups = Vec::new();
-    let mut curr_idx = 0;
-    let chunk_limit = 3000.0;
-
-    while curr_idx < processed.len() {
-        let start = curr_idx;
-        let mut end = processed.len() - 1;
-
-        if hf > chunk_limit {
-            let top = processed[start].pixel_top;
-            // FIX: Removed range loop, used explicit iterator
-            for (i, p) in processed.iter().enumerate().skip(start + 1) {
-                if p.pixel_bottom - top <= chunk_limit {
-                    end = i;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        let slice = &processed[start..=end];
-        let mut uf = UnionFind::new(slice.len());
-
-        let h_lines: Vec<&ProcessedLine> = slice.iter().filter(|l| !l.is_vertical).collect();
-        let v_lines: Vec<&ProcessedLine> = slice.iter().filter(|l| l.is_vertical).collect();
-
-        let med_h = median(&h_lines.iter().map(|l| l.bbox.height).collect::<Vec<_>>());
-        let med_w = median(&v_lines.iter().map(|l| l.bbox.width).collect::<Vec<_>>());
-
-        let rob_h = if med_h > 0.0 { med_h } else { 20.0 };
-        let rob_w = if med_w > 0.0 { med_w } else { 20.0 };
-
-        for i in 0..slice.len() {
-            for j in (i + 1)..slice.len() {
-                let la = &slice[i];
-                let lb = &slice[j];
-                if la.is_vertical != lb.is_vertical {
-                    continue;
-                }
-
-                let med_o = if la.is_vertical { rob_w } else { rob_h };
-                let is_a_prim = la.font_size >= med_o * config.min_line_ratio;
-                let is_b_prim = lb.font_size >= med_o * config.min_line_ratio;
-
-                let ratio_t = if is_a_prim != is_b_prim {
-                    config.font_ratio_for_mixed
-                } else {
-                    config.font_ratio
-                };
-                let f_ratio = f64::max(la.font_size / lb.font_size, lb.font_size / la.font_size);
-
-                if f_ratio > ratio_t {
-                    continue;
-                }
-
-                let dist_t = med_o * config.dist_k;
-                let (gap, overlap) = if la.is_vertical {
-                    (
-                        f64::max(
-                            0.0,
-                            f64::max(la.bbox.x, lb.bbox.x) - f64::min(la.bbox.right, lb.bbox.right),
-                        ),
-                        f64::max(
-                            0.0,
-                            f64::min(la.bbox.bottom, lb.bbox.bottom)
-                                - f64::max(la.bbox.y, lb.bbox.y),
-                        ),
-                    )
-                } else {
-                    (
-                        f64::max(
-                            0.0,
-                            f64::max(la.bbox.y, lb.bbox.y)
-                                - f64::min(la.bbox.bottom, lb.bbox.bottom),
-                        ),
-                        f64::max(
-                            0.0,
-                            f64::min(la.bbox.right, lb.bbox.right) - f64::max(la.bbox.x, lb.bbox.x),
-                        ),
-                    )
-                };
-
-                if gap > dist_t {
-                    continue;
-                }
-
-                let min_perp = f64::min(
-                    if la.is_vertical {
-                        la.bbox.height
-                    } else {
-                        la.bbox.width
-                    },
-                    if lb.is_vertical {
-                        lb.bbox.height
-                    } else {
-                        lb.bbox.width
-                    },
-                );
-
-                if min_perp > 0.0 && (overlap / min_perp) < config.overlap_min {
-                    continue;
-                }
-                if is_a_prim != is_b_prim
-                    && min_perp > 0.0
-                    && (overlap / min_perp) < config.mixed_min_overlap_ratio
-                {
-                    continue;
-                }
-
+    // 2. Cluster
+    let mut uf = UnionFind::new(processed.len());
+    for i in 0..processed.len() {
+        for j in (i + 1)..processed.len() {
+            if are_lines_mergeable(&processed[i], &processed[j], config) {
                 uf.union(i, j);
             }
         }
-
-        let mut map: std::collections::HashMap<usize, Vec<usize>> =
-            std::collections::HashMap::new();
-        // FIX: Removed range loop, used explicit iterator
-        for (i, _) in slice.iter().enumerate() {
-            let r = uf.find(i);
-            map.entry(r).or_default().push(slice[i].original_index);
-        }
-
-        for idxs in map.values() {
-            all_groups.push(idxs.iter().map(|&ix| lines[ix].clone()).collect());
-        }
-
-        curr_idx = end + 1;
     }
 
-    all_groups
+    // 3. Groups
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..processed.len() {
+        groups.entry(uf.find(i)).or_default().push(i);
+    }
+
+    let mut results = Vec::new();
+    for (_, indices) in groups {
+        if indices.is_empty() {
+            continue;
+        }
+
+        if indices.len() == 1 {
+            // Update orientation based on our forced logic
+            let mut line = clean_lines[indices[0]].clone();
+            let is_v = processed[indices[0]].is_vertical;
+            line.forced_orientation = Some(if is_v {
+                "vertical".into()
+            } else {
+                "horizontal".into()
+            });
+            results.push(line);
+            continue;
+        }
+
+        let mut group_lines: Vec<&OcrResult> = indices.iter().map(|&i| &clean_lines[i]).collect();
+
+        // Determine group orientation from first item (they should all match due to merge logic)
+        let is_vertical = processed[indices[0]].is_vertical;
+
+        group_lines.sort_by(|a, b| {
+            let ba = &a.tight_bounding_box;
+            let bb = &b.tight_bounding_box;
+            if is_vertical {
+                let ra = ba.x + ba.width;
+                let rb = bb.x + bb.width;
+                if (ra - rb).abs() > 5.0 {
+                    rb.partial_cmp(&ra).unwrap_or(Ordering::Equal)
+                } else {
+                    ba.y.partial_cmp(&bb.y).unwrap_or(Ordering::Equal)
+                }
+            } else {
+                if (ba.y - bb.y).abs() > 5.0 {
+                    ba.y.partial_cmp(&bb.y).unwrap_or(Ordering::Equal)
+                } else {
+                    ba.x.partial_cmp(&bb.x).unwrap_or(Ordering::Equal)
+                }
+            }
+        });
+
+        // Smart Joining
+        let use_space_separator = if let Some(forced) = config.add_space_on_merge {
+            forced
+        } else {
+            let sample: String = group_lines
+                .iter()
+                .take(3)
+                .map(|l| l.text.as_str())
+                .collect();
+            !NO_SPACE_LANGUAGE_REGEX.is_match(&sample)
+        };
+
+        let mut text_content = String::new();
+
+        for (i, line) in group_lines.iter().enumerate() {
+            if i == 0 {
+                text_content.push_str(&line.text);
+                continue;
+            }
+
+            let prev = &group_lines[i - 1];
+            let curr = line;
+
+            let is_new_line = if is_vertical {
+                let p_x2 = prev.tight_bounding_box.x + prev.tight_bounding_box.width;
+                let c_x1 = curr.tight_bounding_box.x;
+                (p_x2 - c_x1).abs() > 0.0
+            } else {
+                let p_y2 = prev.tight_bounding_box.y + prev.tight_bounding_box.height;
+                let c_y1 = curr.tight_bounding_box.y;
+                (c_y1 - p_y2).max(0.0) > 0.0
+            };
+
+            if is_new_line {
+                text_content.push('\n');
+                text_content.push_str(&curr.text);
+            } else {
+                if use_space_separator {
+                    text_content.push(' ');
+                }
+                text_content.push_str(&curr.text);
+            }
+        }
+
+        let mut points = Vec::new();
+        for l in &group_lines {
+            points.extend(get_bounding_box_corners(&l.tight_bounding_box));
+        }
+        let (cx, cy, w, h, _rot) = calculate_aabb(&points);
+
+        results.push(OcrResult {
+            text: text_content,
+            tight_bounding_box: BoundingBox {
+                x: cx - w / 2.0,
+                y: cy - h / 2.0,
+                width: w,
+                height: h,
+                rotation: None,
+            },
+            is_merged: Some(true),
+            forced_orientation: Some(if is_vertical {
+                "vertical".into()
+            } else {
+                "horizontal".into()
+            }),
+        });
+    }
+
+    results
 }
