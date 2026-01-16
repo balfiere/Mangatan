@@ -58,6 +58,10 @@ clean:
 	rm -rf bin/mangatan/resources/natives.zip
 	rm -rf bin/mangatan_android/assets/*
 	rm -f bin/mangatan_android/mangatan-webui.tar
+	# rm -rf bin/mangatan_ios/Mangatan/webui/*
+	# rm -rf bin/mangatan_ios/Mangatan/lib/*
+	# rm -rf bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
+	# rm -rf bin/mangatan_ios/frameworks/OpenJDK.xcframework
 	rm -f jogamp.7z
 	rm -rf temp_natives 
 	rm -f mangatan-linux-*.tar.gz
@@ -133,8 +137,7 @@ android_icon:
 	cp bin/mangatan_ios/Mangatan/Assets.xcassets/AppIcon.appiconset/mangatanlogo11.png bin/mangatan_android/res/mipmap-hdpi/ic_launcher.png
 	cp bin/mangatan_ios/Mangatan/Assets.xcassets/AppIcon.appiconset/mangatanlogo11.png bin/mangatan_android/res/mipmap-mdpi/ic_launcher.png
 
-.PHONY: ios_webui
-ios_webui: build_webui
+bin/mangatan_ios/Mangatan/webui/index.html: Mangatan-WebUI/build/index.html
 	@echo "Packaging WebUI for iOS..."
 	@# Ensure directory exists
 	mkdir -p bin/mangatan_ios/Mangatan/webui
@@ -147,6 +150,9 @@ ios_webui: build_webui
 	@echo "Copying new files..."
 	cp -r Mangatan-WebUI/build/* bin/mangatan_ios/Mangatan/webui/
 	@echo "✅ iOS WebUI updated."
+
+.PHONY: ios_webui
+ios_webui: bin/mangatan_ios/Mangatan/webui/index.html
 
 # ---------------------
 
@@ -271,16 +277,17 @@ bin/mangatan/resources/Suwayomi-Server.jar:
 .PHONY: download_jar
 download_jar: bin/mangatan/resources/Suwayomi-Server.jar
 
-.PHONY: download_ios_jar
-download_ios_jar:
+bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar:
 	@echo "Downloading iOS Suwayomi Server JAR..."
 	mkdir -p bin/mangatan_ios/Mangatan/jar
 	rm -f bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
-	curl -L "https://github.com/KolbyML/Suwayomi-Server/releases/download/v1.0.4/Suwayomi-Server-v2.1.2062.jar" -o bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
+	curl -L "https://github.com/KolbyML/Suwayomi-Server/releases/download/v1.0.4/Suwayomi-Server-v2.1.2062.jar" -o $@
+
+.PHONY: download_ios_jar
+download_ios_jar: bin/mangatan_ios/Mangatan/jar/suwayomi-server.jar
 
 
-.PHONY: ios_framework
-ios_framework:
+bin/mangatan_ios/frameworks/OpenJDK.xcframework:
 	@echo "Preparing iOS Framework..."
 	mkdir -p bin/mangatan_ios/frameworks
 	rm -f ios_framework.zip
@@ -291,16 +298,17 @@ ios_framework:
 	curl -L "https://github.com/KolbyML/ios-tools/releases/download/snapshot/OpenJDK.xcframework.zip" -o ios_framework.zip
 	
 	@echo "Extracting..."
-	# -o overwrites files without prompting, -d specifies destination
 	unzip -o ios_framework.zip -d bin/mangatan_ios/frameworks
 	
 	@echo "Cleanup..."
 	rm ios_framework.zip
-	@echo "✅ iOS Framework ready at bin/mangatan_ios/frameworks"
 	cd bin/mangatan_ios/frameworks/OpenJDK.xcframework/ios-arm64 && ar -d libdevice.a java_md_macosx.o
+	@echo "✅ iOS Framework ready at bin/mangatan_ios/frameworks"
 
-.PHONY: ios_jre
-ios_jre:
+.PHONY: ios_framework
+ios_framework: bin/mangatan_ios/frameworks/OpenJDK.xcframework
+
+bin/mangatan_ios/Mangatan/lib/lib/modules:
 	@echo "Downloading iOS JRE..."
 	mkdir -p bin/mangatan_ios/Mangatan/lib
 	# Clean destination to ensure no stale files
@@ -315,8 +323,6 @@ ios_jre:
 	unzip -q ios_jre.zip -d temp_ios_jre_extract
 
 	@echo "Installing to bin/mangatan_ios/Mangatan/lib..."
-	# Logic: Enter temp dir. If there is exactly 1 item and it is a directory, enter it.
-	# Then copy everything from current location to destination.
 	cd temp_ios_jre_extract && \
 	if [ "$$(ls -1 | wc -l)" -eq "1" ] && [ -d "$$(ls -1)" ]; then \
 		cd *; \
@@ -327,7 +333,14 @@ ios_jre:
 	rm -rf temp_ios_jre_extract
 	rm ios_jre.zip
 	rm -rf bin/mangatan_ios/Mangatan/lib/__MACOSX
+	
+	# Touch the file to ensure timestamp is updated
+	touch bin/mangatan_ios/Mangatan/lib/lib/modules
 	@echo "✅ iOS JRE installed."
+
+.PHONY: ios_jre
+ios_jre: bin/mangatan_ios/Mangatan/lib/lib/modules
+
 
 .PHONY: docker-build
 docker-build: desktop_webui download_jar download_natives bundle_jre

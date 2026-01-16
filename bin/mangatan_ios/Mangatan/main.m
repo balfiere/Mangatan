@@ -116,6 +116,8 @@ int main(int argc, char * argv[]) {
     options[optCount++].optionString = "-Djava.awt.headless=true";
     options[optCount++].optionString = "-Xverify:none";
     options[optCount++].optionString = "-Xmx256m";
+    options[optCount++].optionString = "-XX:+UseSerialGC";
+    options[optCount++].optionString = "-XX:-TieredCompilation"; 
     options[optCount++].optionString = "-Dos.name=Linux";
     options[optCount++].optionString = "-Dos.version=5.15.0";
     options[optCount++].optionString = "-Dos.arch=aarch64";
